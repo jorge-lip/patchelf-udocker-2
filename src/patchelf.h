@@ -179,7 +179,7 @@ public:
     void modifyExecstack(ExecstackMode op);
 
     /* udocker START */
-    void getNeededLibs();
+    void getNeededLibs() const;
     /* udocker END */
 
 private:
