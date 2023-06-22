@@ -1481,7 +1481,7 @@ template<ElfFileParams>
 void ElfFile<ElfFileParamNames>::setInterpreter(const std::string & newInterpreter)
 {
     /* udocker START */
-    std::string oldInterpreter = elfFile.getInterpreter();
+    std::string oldInterpreter = getInterpreter();
     if (oldInterpreter == "" || newInterpreter == oldInterpreter) {
 	    return;
     }

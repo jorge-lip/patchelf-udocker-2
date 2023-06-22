@@ -178,6 +178,10 @@ public:
 
     void modifyExecstack(ExecstackMode op);
 
+    /* udocker START */
+    void getNeededLibs();
+    /* udocker END */
+
 private:
     struct GnuHashTable {
         using BloomWord = Elf_Addr;
