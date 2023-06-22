@@ -1,4 +1,5 @@
 AM_CXXFLAGS = -Wall -Wextra -Wcast-qual -std=c++17 -D_FILE_OFFSET_BITS=64
+AM_LDFLAGS = -static
 
 if WITH_ASAN
 AM_CXXFLAGS += -fsanitize=address -fsanitize-address-use-after-scope
