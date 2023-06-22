@@ -464,7 +464,10 @@ static void writeFile(const std::string & fileName, const FileContents & content
 {
     debug("writing %s\n", fileName.c_str());
 
-    int fd = open(fileName.c_str(), O_CREAT | O_TRUNC | O_WRONLY | O_BINARY | O_EXCL, 0777);
+    /*
+    int fd = open(fileName.c_str(), O_CREAT | O_TRUNC | O_WRONLY | O_BINARY, 0777);
+    */
+    int fd = open(fileName.c_str(), O_TRUNC | O_WRONLY | O_BINARY, 0777);
     if (fd == -1)
         error("open");
 
