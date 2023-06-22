@@ -41,6 +41,7 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/file.h>
 #include <unistd.h>
 
 #include "elf.h"
@@ -71,6 +72,17 @@ static int forcedPageSize = -1;
 #ifndef EM_LOONGARCH
 #define EM_LOONGARCH    258
 #endif
+
+/* udocker START */
+static bool quietMode = false;
+static std::string patchRootPath;
+static std::string restoreRootPath;
+static std::string gotRPath;
+static std::string patchRPath;
+static std::set<std::string> gotNeededLibs;
+static std::map<std::string, std::string> patchReplaceLibs;
+/* udocker END */
+
 
 [[nodiscard]] static std::vector<std::string> splitColonDelimitedString(std::string_view s)
 {
@@ -1259,7 +1271,8 @@ void ElfFile<ElfFileParamNames>::rewriteHeaders(Elf_Addr phdrAddress)
                        is broken, and it's not our job to fix it; yet, we have
                        to find some location for dynamic loader to write the
                        debug pointer to; well, let's write it right here */
-                    fprintf(stderr, "warning: DT_MIPS_RLD_MAP_REL entry is present, but .rld_map section is not\n");
+		    if (! quietMode)
+                        fprintf(stderr, "warning: DT_MIPS_RLD_MAP_REL entry is present, but .rld_map section is not\n");
                     dyn->d_un.d_ptr = 0;
                 }
             }
@@ -1278,7 +1291,8 @@ void ElfFile<ElfFileParamNames>::rewriteHeaders(Elf_Addr phdrAddress)
             unsigned int shndx = rdi(sym->st_shndx);
             if (shndx != SHN_UNDEF && shndx < SHN_LORESERVE) {
                 if (shndx >= sectionsByOldIndex.size()) {
-                    fprintf(stderr, "warning: entry %d in symbol table refers to a non-existent section, skipping\n", shndx);
+		    if (! quietMode)
+                        fprintf(stderr, "warning: entry %d in symbol table refers to a non-existent section, skipping\n", shndx);
                     continue;
                 }
                 const std::string & section = sectionsByOldIndex.at(shndx);
@@ -1454,6 +1468,12 @@ void ElfFile<ElfFileParamNames>::modifySoname(sonameMode op, const std::string &
 template<ElfFileParams>
 void ElfFile<ElfFileParamNames>::setInterpreter(const std::string & newInterpreter)
 {
+    /* udocker START */
+    std::string oldInterpreter = elfFile.getInterpreter();
+    if (oldInterpreter == "" || newInterpreter == oldInterpreter) {
+	    return;
+    }
+    /* udocker END */
     std::string & section = replaceSection(".interp", newInterpreter.size() + 1);
     setSubstr(section, 0, newInterpreter + '\0');
     changed = true;
@@ -1591,6 +1611,12 @@ void ElfFile<ElfFileParamNames>::modifyRPath(RPathOp op,
             printf("%s\n", rpath ? rpath : "");
             return;
         }
+        /* udocker START */
+        case rpGet: {
+	    gotRPath = rpath ? rpath : "";
+	    return;
+        }			    
+	/* udocker END */
         case rpRemove: {
             if (!rpath) {
                 debug("no RPATH to delete\n");
@@ -1924,6 +1950,29 @@ void ElfFile<ElfFileParamNames>::printNeededLibs() const
         }
     }
 }
+
+/* udocker START */
+template<ElfFileParams>
+void ElfFile<ElfFileParamNames>::getNeededLibs() const
+{
+    const auto shdrDynamic = findSectionHeader(".dynamic");
+    const auto shdrDynStr = findSectionHeader(".dynstr");
+    const char *strTab = (const char *)fileContents->data() + rdi(shdrDynStr.sh_offset);
+
+    const Elf_Dyn *dyn = (const Elf_Dyn *) (fileContents->data() + rdi(shdrDynamic.sh_offset));
+
+    for (; rdi(dyn->d_tag) != DT_NULL; dyn++) {
+        if (rdi(dyn->d_tag) == DT_NEEDED) {
+	    /*
+            const char *name = strTab + rdi(dyn->d_un.d_val);
+            printf("%s\n", name);
+	    */
+            std::string name = strTab + rdi(dyn->d_un.d_val);
+	    gotNeededLibs.insert(name);
+        }
+    }
+}
+/* udocker END */
 
 
 template<ElfFileParams>
@@ -2385,9 +2434,152 @@ static bool printExecstack = false;
 static bool clearExecstack = false;
 static bool setExecstack = false;
 
+/* udocker START */
+template<class ElfFile>
+void rootPatch(ElfFile && elfFile)
+{
+    if (patchRootPath == "")
+        return;
+
+    if (newInterpreter == "") {
+        try {
+            std::string oldInterpreter = elfFile.getInterpreter();
+            if (oldInterpreter != "" && oldInterpreter.compare(0, patchRootPath.length(), patchRootPath) != 0) {
+                elfFile.setInterpreter(patchRootPath + "/" + oldInterpreter);
+                elfFile.rewriteSections();
+            }
+        } catch (std::exception & e) {
+            if (debugMode || !quietMode)
+                fprintf(stderr, "patchelf: %s\n", e.what());
+            /* continue */
+        }
+    }
+
+   /* PATCH RPATCH MULTIPLE ENTRIES */
+    elfFile.modifyRPath(elfFile.rpGet, {}, "");
+    if (gotRPath != "") {
+        patchRPath = "";
+        for (auto & dirName : splitColonDelimitedString(gotRPath.c_str())) {
+            /* Jan 2021 $ORIGIN:$ORIGIN case where colon is removed */
+            if (patchRPath != "")
+                 patchRPath += ":";
+            if (dirName.compare(0, strlen("$ORIGIN"), "$ORIGIN") == 0) {
+                patchRPath += dirName;
+                continue;
+            }
+            if (dirName.compare(0, patchRootPath.length(), patchRootPath) != 0) {
+                patchRPath += patchRootPath + "/" + dirName;
+            }
+            else {
+                patchRPath += dirName;
+            }
+        }
+        if (patchRPath != gotRPath) {
+            elfFile.modifyRPath(elfFile.rpSet, {}, patchRPath);
+            elfFile.rewriteSections();
+        }
+    }
+
+/*
+    if (gotRPath != "" && gotRPath.compare(0, patchRootPath.length(), patchRootPath) != 0) {
+        patchRPath = patchRootPath + "/" + gotRPath;
+        elfFile.modifyRPath(elfFile.rpSet, {}, patchRPath);
+        elfFile.rewriteSections();
+    }
+*/
+
+    elfFile.modifyRPath(elfFile.rpGet, {}, "");
+    elfFile.getNeededLibs();
+    for (auto & lib : gotNeededLibs) {
+        if (lib != "" && lib[0] == '/' && lib.compare(0, patchRootPath.length(), patchRootPath) != 0)
+            patchReplaceLibs[lib] = patchRootPath + "/" + lib;
+    }
+    if (!patchReplaceLibs.empty()) {
+        elfFile.replaceNeeded(patchReplaceLibs);
+        elfFile.rewriteSections();
+    }
+}
+/* udocker END */
+
+/* udocker START */
+template<class ElfFile>
+void rootRestore(ElfFile && elfFile)
+{
+    if (restoreRootPath == "")
+        return;
+    restoreRootPath = restoreRootPath + "/";
+
+    if (newInterpreter == "") {
+        try {
+            std::string oldInterpreter = elfFile.getInterpreter();
+            if (oldInterpreter != "" && oldInterpreter.compare(0, restoreRootPath.length(), restoreRootPath) == 0) {
+                elfFile.setInterpreter(oldInterpreter.substr(restoreRootPath.length()));
+                elfFile.rewriteSections();
+            }
+        } catch (std::exception & e) {
+            if (debugMode || !quietMode)
+                fprintf(stderr, "patchelf: %s\n", e.what());
+            /* continue */
+        }
+    }
+
+   /* RESTORE RPATH MULTIPLE ENTRIES */
+    elfFile.modifyRPath(elfFile.rpGet, {}, "");
+    if (gotRPath != "") {
+        patchRPath = "";
+        for (auto & dirName : splitColonDelimitedString(gotRPath.c_str())) {
+            /* Jan 2021 $ORIGIN:$ORIGIN case where colon is removed */
+            if (patchRPath != "")
+                 patchRPath += ":";
+            if (dirName.compare(0, strlen("$ORIGIN"), "$ORIGIN") == 0) {
+                patchRPath += dirName;
+                continue;
+            }
+            if (dirName.compare(0, restoreRootPath.length(), restoreRootPath) == 0) {
+                patchRPath += dirName.substr(restoreRootPath.length());
+            }
+            else {
+                patchRPath += dirName;
+            }
+        }
+        if (patchRPath != gotRPath) {
+            elfFile.modifyRPath(elfFile.rpSet, {}, patchRPath);
+            elfFile.rewriteSections();
+        }
+    }
+
+/*
+    elfFile.modifyRPath(elfFile.rpGet, {}, "");
+    if (gotRPath != "" && gotRPath.compare(0, restoreRootPath.length(), restoreRootPath) == 0) {
+        patchRPath = gotRPath.substr(restoreRootPath.length());
+        elfFile.modifyRPath(elfFile.rpSet, {}, patchRPath);
+        elfFile.rewriteSections();
+    }
+*/
+
+    elfFile.modifyRPath(elfFile.rpGet, {}, "");
+    elfFile.getNeededLibs();
+    for (auto & lib : gotNeededLibs) {
+        if (lib != "" && lib[0] == '/' && lib.compare(0, restoreRootPath.length(), restoreRootPath) == 0)
+            patchReplaceLibs[lib] = lib.substr(restoreRootPath.length());
+    }
+    if (!patchReplaceLibs.empty()) {
+        elfFile.replaceNeeded(patchReplaceLibs);
+        elfFile.rewriteSections();
+    }
+}
+/* udocker END */
+
+
 template<class ElfFile>
 static void patchElf2(ElfFile && elfFile, const FileContents & fileContents, const std::string & fileName)
 {
+
+    /* udocker START */
+    rootPatch(elfFile);
+    rootRestore(elfFile);
+    /* udocker END */
+
     if (printInterpreter)
         printf("%s\n", elfFile.getInterpreter().c_str());
 
@@ -2434,7 +2626,6 @@ static void patchElf2(ElfFile && elfFile, const FileContents & fileContents, con
 
     if (noDefaultLib)
         elfFile.noDefaultLib();
-
     if (addDebugTag)
         elfFile.addDebugTag();
 
@@ -2506,6 +2697,9 @@ static void showHelp(const std::string & progName)
   [--set-execstack]\n\
   [--rename-dynamic-symbols NAME_MAP_FILE]\tRenames dynamic symbols. The map file should contain two symbols (old_name new_name) per line\n\
   [--output FILE]\n\
+  [--set-root-prefix PATH_PREFIX]\n\
+  [--restore-root-prefix PATH_PREFIX]\n\
+  [--quiet]\n\
   [--debug]\n\
   [--version]\n\
   FILENAME...\n", progName.c_str());
@@ -2661,6 +2855,21 @@ static int mainWrapped(int argc, char * * argv)
                 symbolsToRename[*symbolsToRenameKeys.insert(from).first] = to;
             }
         }
+
+	/* udocker START */
+        else if (arg == "--quiet" || arg == "-q") {
+            quietMode = true;
+        }
+        else if (arg == "--set-root-prefix") {
+            if (++i == argc) error("missing argument");
+            patchRootPath = resolveArgument(argv[i]);
+        }
+        else if (arg == "--restore-root-prefix") {
+            if (++i == argc) error("missing argument");
+            restoreRootPath = resolveArgument(argv[i]);
+        }
+        /* udocker END */
+
         else if (arg == "--help" || arg == "-h" ) {
             showHelp(argv[0]);
             return 0;
@@ -2692,7 +2901,8 @@ int main(int argc, char * * argv)
     try {
         return mainWrapped(argc, argv);
     } catch (std::exception & e) {
-        fprintf(stderr, "patchelf: %s\n", e.what());
+	if ( ! quietMode)
+            fprintf(stderr, "patchelf: %s\n", e.what());
         return 1;
     }
 }
